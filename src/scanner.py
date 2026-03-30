@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -11,6 +12,8 @@ from typing import Callable, List, Optional
 import psutil
 
 from .models import FileNode
+
+_logger = logging.getLogger(__name__)
 
 
 class ScanCancelledError(Exception):
@@ -28,10 +31,15 @@ class FileSystemScanner:
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._scanned_count = 0
+        # Timestamp of the last progress callback emission.  Reset each scan.
+        # Intentionally not lock-protected — occasional duplicate emissions
+        # from parallel threads are harmless for throttling purposes.
+        self._last_progress_time: float = 0.0
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
+    # Minimum interval (seconds) between progress_callback invocations.
+    # This prevents flooding the Qt event queue on large scans (400 k+ files).
+    _PROGRESS_INTERVAL = 0.10  # 100 ms
+
 
     @staticmethod
     def list_disks() -> List[str]:
@@ -78,6 +86,9 @@ class FileSystemScanner:
             depth: Current recursion depth (used internally).
             progress_callback: Called with (count, current_path) as scanning
                                proceeds. May be called from worker threads.
+                               Calls are time-throttled to at most once per
+                               ``_PROGRESS_INTERVAL`` seconds to avoid
+                               excessive UI updates on large scans.
             max_depth: Maximum recursion depth. None means unlimited.
 
         Returns:
@@ -88,6 +99,7 @@ class FileSystemScanner:
         """
         self.reset_cancel()
         self._scanned_count = 0
+        self._last_progress_time = 0.0
         return self._scan_node(path, depth, progress_callback, max_depth)
 
     def scan_directory_threaded(
@@ -101,9 +113,12 @@ class FileSystemScanner:
         """
         self.reset_cancel()
         self._scanned_count = 0
+        self._last_progress_time = 0.0
+        start_time = time.monotonic()
 
         stat = self._safe_stat(path)
         if stat is None:
+            _logger.warning("Cannot access directory: %s", path)
             return self._error_node(path, "Cannot access directory")
 
         root = FileNode(
@@ -117,7 +132,12 @@ class FileSystemScanner:
 
         try:
             entries = list(os.scandir(path))
-        except (PermissionError, OSError) as exc:
+        except PermissionError as exc:
+            _logger.warning("Permission denied listing %s: %s", path, exc)
+            root.error = str(exc)
+            return root
+        except OSError as exc:
+            _logger.warning("OS error listing %s: %s", path, exc)
             root.error = str(exc)
             return root
 
@@ -132,10 +152,14 @@ class FileSystemScanner:
             child = self._node_from_entry(entry)
             root.add_child(child)
             root.size += child.size
+            root.file_count += 1
             with self._lock:
                 self._scanned_count += 1
             if progress_callback:
-                progress_callback(self._scanned_count, entry.path)
+                _now = time.monotonic()
+                if _now - self._last_progress_time >= self._PROGRESS_INTERVAL:
+                    self._last_progress_time = _now
+                    progress_callback(self._scanned_count, entry.path)
 
         # Process sub-dirs in parallel
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
@@ -153,11 +177,25 @@ class FileSystemScanner:
                 if self._cancel_event.is_set():
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise ScanCancelledError("Scan cancelled")
-                child = future.result()
+                try:
+                    child = future.result()
+                except ScanCancelledError:
+                    raise
+                except Exception as exc:
+                    entry = future_to_entry[future]
+                    _logger.warning("Error scanning %s: %s", entry.path, exc)
+                    child = self._error_node(entry.path, str(exc))
                 root.add_child(child)
                 root.size += child.size
                 root.file_count += child.file_count
 
+        elapsed = time.monotonic() - start_time
+        count = self._scanned_count
+        throughput = count / elapsed if elapsed > 0 else 0
+        _logger.info(
+            "Scan complete: path=%s  items=%d  elapsed=%.2fs  throughput=%.0f items/s",
+            path, count, elapsed, throughput,
+        )
         return root
 
     # ------------------------------------------------------------------
@@ -176,6 +214,7 @@ class FileSystemScanner:
 
         stat = self._safe_stat(path)
         if stat is None:
+            _logger.debug("Cannot stat: %s", path)
             return self._error_node(path, "Cannot access")
 
         node = FileNode(
@@ -194,7 +233,12 @@ class FileSystemScanner:
 
         try:
             entries = list(os.scandir(path))
-        except (PermissionError, OSError) as exc:
+        except PermissionError as exc:
+            _logger.debug("Permission denied: %s – %s", path, exc)
+            node.error = str(exc)
+            return node
+        except OSError as exc:
+            _logger.debug("OS error scanning %s: %s", path, exc)
             node.error = str(exc)
             return node
 
@@ -202,11 +246,17 @@ class FileSystemScanner:
             if self._cancel_event.is_set():
                 raise ScanCancelledError("Scan cancelled")
 
-            if entry.is_dir(follow_symlinks=False):
-                child = self._scan_node(entry.path, depth + 1, progress_callback, max_depth)
-            else:
-                child = self._node_from_entry(entry)
-                node.file_count += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    child = self._scan_node(entry.path, depth + 1, progress_callback, max_depth)
+                else:
+                    child = self._node_from_entry(entry)
+                    node.file_count += 1
+            except ScanCancelledError:
+                raise
+            except Exception as exc:
+                _logger.debug("Skipping entry %s: %s", entry.path, exc)
+                child = self._error_node(entry.path, str(exc))
 
             node.add_child(child)
             node.size += child.size
@@ -214,8 +264,13 @@ class FileSystemScanner:
 
             with self._lock:
                 self._scanned_count += 1
+            # Throttle: emit at most once per _PROGRESS_INTERVAL to avoid
+            # flooding the UI event queue on large scans (400 k+ files).
             if progress_callback:
-                progress_callback(self._scanned_count, entry.path)
+                _now = time.monotonic()
+                if _now - self._last_progress_time >= self._PROGRESS_INTERVAL:
+                    self._last_progress_time = _now
+                    progress_callback(self._scanned_count, entry.path)
 
         return node
 
