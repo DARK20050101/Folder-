@@ -4,6 +4,9 @@ psutil>=5.9.0
 # GUI framework (recommended)
 PyQt6>=6.4.0
 
+# Recycle bin / trash support for the delete-to-trash context-menu action
+send2trash>=1.8.0
+
 # Optional: data analysis extras
 # pandas>=1.5.0
 # numpy>=1.23.0

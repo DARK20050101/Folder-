@@ -7,6 +7,12 @@ import sys
 
 def main() -> None:
     """Launch the DiskExplorer GUI application."""
+    # Configure logging before any other imports so that every module that
+    # calls ``logging.getLogger(__name__)`` automatically writes to the
+    # project-local log file instead of APPDATA or similar locations.
+    from src.app_logger import setup_logging
+    setup_logging()
+
     try:
         from PyQt6.QtWidgets import QApplication
         from src.ui.main_window import MainWindow
