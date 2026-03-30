@@ -42,6 +42,11 @@ class FileNodeModel(QAbstractItemModel):
             self._build_parent_map(root, None)
         self.endResetModel()
 
+    @property
+    def root(self) -> Optional[FileNode]:
+        """Return the current root FileNode (read-only)."""
+        return self._root
+
     def _build_parent_map(self, node: FileNode, parent: Optional[FileNode]) -> None:
         self._parent_map[id(node)] = parent
         for child in node.children:
@@ -84,7 +89,12 @@ class FileNodeModel(QAbstractItemModel):
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if not parent.isValid():
-            return 1 if self._root else 0
+            if self._root is None:
+                return 0
+            # Show root's children directly at the top level so that all
+            # top-level directories (Windows, Users, Program Files, …) are
+            # visible without having to expand a single root item.
+            return len(self._root.children)
         node: FileNode = parent.internalPointer()
         return len(node.children)
 
@@ -93,7 +103,7 @@ class FileNodeModel(QAbstractItemModel):
 
     def hasChildren(self, parent: QModelIndex = QModelIndex()) -> bool:
         if not parent.isValid():
-            return self._root is not None
+            return bool(self._root and self._root.children)
         node: FileNode = parent.internalPointer()
         return node.is_dir and bool(node.children)
 
@@ -132,6 +142,34 @@ class FileNodeModel(QAbstractItemModel):
 
         return None
 
+    def index_for_node(self, target: FileNode) -> QModelIndex:
+        """Return the QModelIndex for *target*, or an invalid index if not found."""
+        if self._root is None or target is self._root:
+            return QModelIndex()
+        # Build path from target up to (but not including) root
+        path_to_root: list = []
+        current: Optional[FileNode] = target
+        while current is not None and current is not self._root:
+            path_to_root.append(current)
+            current = self._parent_map.get(id(current))
+        if current is not self._root:
+            return QModelIndex()  # target not in this tree
+        # path_to_root is [target, …, direct-child-of-root]; reverse it
+        path_to_root.reverse()
+        idx = QModelIndex()
+        for node in path_to_root:
+            parent_node = self._parent_map.get(id(node))
+            if parent_node is self._root or parent_node is None:
+                siblings = self._root.get_children_sorted("size")
+            else:
+                siblings = parent_node.get_children_sorted("size")
+            try:
+                row = siblings.index(node)
+            except ValueError:
+                return QModelIndex()
+            idx = self.createIndex(row, 0, node)
+        return idx
+
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             if 0 <= section < len(self.COLUMNS):
@@ -167,6 +205,22 @@ class FileSystemTreeView(QTreeView):
     def set_root(self, node: FileNode) -> None:
         self._node_model.set_root(node)
         self.expandToDepth(0)
+
+    def navigate_to_path(self, path: str) -> bool:
+        """Expand and select the node with *path*. Returns True on success."""
+        if self._node_model.root is None:
+            return False
+        target = self._node_model.root.find(path)
+        if target is None:
+            return False
+        idx = self._node_model.index_for_node(target)
+        if not idx.isValid():
+            return False
+        self.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.selectionModel().setCurrentIndex(
+            idx, self.selectionModel().SelectionFlag.ClearAndSelect | self.selectionModel().SelectionFlag.Rows
+        )
+        return True
 
     def _on_current_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
         if current.isValid():

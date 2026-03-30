@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import logging
 import os
-import threading
 import time
 from typing import Optional
 
@@ -30,35 +30,53 @@ from ..export import ExportHandler
 from ..models import DiskDataModel, FileNode
 from ..scanner import FileSystemScanner, ScanCancelledError
 from .chart_widget import SizeChartWidget
+from .recent_files_panel import RecentFilesPanel
 from .tree_view import FileSystemTreeView
+
+_logger = logging.getLogger(__name__)
 
 
 class ScanWorker(QThread):
     """Background thread that runs the file system scan."""
 
-    progress = pyqtSignal(int, str)   # (count, current_path)
-    finished = pyqtSignal(object)     # FileNode on success
-    error = pyqtSignal(str)           # error message
+    progress = pyqtSignal(int, str)    # (count, current_path) – throttled
+    finished = pyqtSignal(object)      # FileNode on success
+    error = pyqtSignal(str)            # error message
+    scan_stats = pyqtSignal(float, int)  # (elapsed_seconds, item_count)
+
+    # Minimum interval between progress signal emissions (seconds).
+    _PROGRESS_THROTTLE = 0.25
 
     def __init__(self, scanner: FileSystemScanner, path: str) -> None:
         super().__init__()
         self._scanner = scanner
         self._path = path
+        self._last_emit = 0.0
+        self._scan_start = 0.0
 
     def run(self) -> None:
+        self._scan_start = time.monotonic()
         try:
             node = self._scanner.scan_directory_threaded(
                 self._path,
                 progress_callback=self._on_progress,
             )
+            elapsed = time.monotonic() - self._scan_start
+            self.scan_stats.emit(elapsed, self._scanner._scanned_count)
             self.finished.emit(node)
         except ScanCancelledError:
             self.error.emit("Scan cancelled.")
         except Exception as exc:
+            _logger.exception("Unexpected scan error for %s", self._path)
             self.error.emit(str(exc))
 
     def _on_progress(self, count: int, path: str) -> None:
-        self.progress.emit(count, path)
+        # Secondary throttle at the signal-emission layer so that rapid
+        # callbacks from the scanner thread don't flood the Qt event queue.
+        now = time.monotonic()
+        if now - self._last_emit >= self._PROGRESS_THROTTLE:
+            self._last_emit = now
+            self.progress.emit(count, path)
 
 
 class MainWindow(QMainWindow):
@@ -72,6 +90,9 @@ class MainWindow(QMainWindow):
         self._exporter = ExportHandler()
         self._scan_worker: Optional[ScanWorker] = None
         self._current_root: Optional[FileNode] = None
+        # Timing populated by ScanWorker.scan_stats signal
+        self._last_scan_elapsed: float = 0.0
+        self._last_scan_count: int = 0
 
         self._setup_ui()
         self._setup_menu()
@@ -83,7 +104,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self) -> None:
         self.setWindowTitle("DiskExplorer – Disk Space Analyzer")
-        self.resize(1200, 700)
+        self.resize(1200, 800)
 
         # --- Central widget ---
         central = QWidget()
@@ -118,15 +139,25 @@ class MainWindow(QMainWindow):
         self._progress_bar.setVisible(False)
         main_layout.addWidget(self._progress_bar)
 
-        # --- Splitter: tree (left) + chart (right) ---
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # --- Top splitter: tree (left) + chart (right) ---
+        top_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._tree_view = FileSystemTreeView()
         self._tree_view.node_selected.connect(self._on_node_selected)
         self._chart_widget = SizeChartWidget()
-        splitter.addWidget(self._tree_view)
-        splitter.addWidget(self._chart_widget)
-        splitter.setSizes([700, 500])
-        main_layout.addWidget(splitter)
+        top_splitter.addWidget(self._tree_view)
+        top_splitter.addWidget(self._chart_widget)
+        top_splitter.setSizes([700, 500])
+
+        # --- Recent Files panel ---
+        self._recent_panel = RecentFilesPanel()
+        self._recent_panel.locate_requested.connect(self._on_locate_requested)
+
+        # --- Vertical splitter: top (tree+chart) + bottom (recent files) ---
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
+        v_splitter.addWidget(top_splitter)
+        v_splitter.addWidget(self._recent_panel)
+        v_splitter.setSizes([500, 200])
+        main_layout.addWidget(v_splitter)
 
         # --- Status bar ---
         self._status_bar = QStatusBar()
@@ -220,18 +251,35 @@ class MainWindow(QMainWindow):
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
+        self._scan_worker.scan_stats.connect(self._on_scan_stats)
         self._scan_worker.start()
 
     def _on_scan_progress(self, count: int, path: str) -> None:
-        self._status_bar.showMessage(f"Scanned {count} items… {path[:80]}")
+        self._status_bar.showMessage(f"Scanned {count:,} items… {path[:80]}")
+
+    def _on_scan_stats(self, elapsed: float, count: int) -> None:
+        """Store performance stats emitted by the worker before finished."""
+        self._last_scan_elapsed = elapsed
+        self._last_scan_count = count
 
     def _on_scan_finished(self, node: FileNode) -> None:
         self._cache.save(node.path, node)
         self._model.set_root(node.path, node)
         self._display_result(node)
         self._reset_scan_controls()
+        elapsed = self._last_scan_elapsed
+        count = self._last_scan_count
+        throughput = count / elapsed if elapsed > 0 else 0
         self._status_bar.showMessage(
-            f"Done. {node.formatted_size} in {node.file_count} files."
+            f"Done. {node.formatted_size} in {node.file_count:,} files. "
+            f"Scanned {count:,} items in {elapsed:.1f}s "
+            f"({throughput:,.0f} items/s)."
+        )
+        _logger.info(
+            "UI scan finished: path=%s  size=%s  files=%d  "
+            "items=%d  elapsed=%.2fs  throughput=%.0f items/s",
+            node.path, node.formatted_size, node.file_count,
+            count, elapsed, throughput,
         )
 
     def _on_scan_error(self, message: str) -> None:
@@ -257,6 +305,7 @@ class MainWindow(QMainWindow):
         self._addr_label.setText(f"Path: {node.path}  [{node.formatted_size}]")
         self._tree_view.set_root(node)
         self._chart_widget.display(node)
+        self._recent_panel.set_root(node)
 
     def _on_node_selected(self, node: FileNode) -> None:
         self._chart_widget.display(node)
@@ -264,6 +313,14 @@ class MainWindow(QMainWindow):
             f"{node.path}  {node.formatted_size}"
             + (f"  ({node.file_count} files)" if node.is_dir else "")
         )
+        # Update Recent Files panel scope when a directory is selected
+        if node.is_dir:
+            self._recent_panel.set_current_dir(node)
+
+    def _on_locate_requested(self, path: str) -> None:
+        """Locate a file path in the tree view (called from Recent Files panel)."""
+        if not self._tree_view.navigate_to_path(path):
+            self._status_bar.showMessage(f"Could not locate: {path}")
 
     # ------------------------------------------------------------------
     # Actions
