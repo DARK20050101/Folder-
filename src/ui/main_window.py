@@ -7,7 +7,7 @@ import os
 import time
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -90,6 +90,11 @@ class MainWindow(QMainWindow):
         self._exporter = ExportHandler()
         self._scan_worker: Optional[ScanWorker] = None
         self._current_root: Optional[FileNode] = None
+        self._pending_selected_node: Optional[FileNode] = None
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(180)
+        self._selection_timer.timeout.connect(self._apply_selected_node)
         # Timing populated by ScanWorker.scan_stats signal
         self._last_scan_elapsed: float = 0.0
         self._last_scan_count: int = 0
@@ -311,6 +316,13 @@ class MainWindow(QMainWindow):
         self._recent_panel.set_root(node)
 
     def _on_node_selected(self, node: FileNode) -> None:
+        self._pending_selected_node = node
+        self._selection_timer.start()
+
+    def _apply_selected_node(self) -> None:
+        node = self._pending_selected_node
+        if node is None:
+            return
         self._chart_widget.display(node)
         self._status_bar.showMessage(
             f"{node.path}  {node.formatted_size}"

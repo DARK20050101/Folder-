@@ -31,6 +31,11 @@ class FileNode:
     file_count: int = 0
     children: List["FileNode"] = field(default_factory=list)
     error: Optional[str] = None
+    _sorted_children_cache: Dict[tuple[str, bool], List["FileNode"]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def formatted_size(self) -> str:
@@ -48,13 +53,21 @@ class FileNode:
     def add_child(self, child: "FileNode") -> None:
         """Add a child node and update size and file counts."""
         self.children.append(child)
+        # Child order changed; invalidate cached sort projections.
+        self._sorted_children_cache.clear()
 
     def get_children_sorted(self, key: str = "size", reverse: bool = True) -> List["FileNode"]:
         """Return children sorted by the given key."""
         valid_keys = {"size", "name", "mod_time", "create_time", "file_count"}
         if key not in valid_keys:
             key = "size"
-        return sorted(self.children, key=lambda n: getattr(n, key), reverse=reverse)
+        cache_key = (key, reverse)
+        cached = self._sorted_children_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        sorted_children = sorted(self.children, key=lambda n: getattr(n, key), reverse=reverse)
+        self._sorted_children_cache[cache_key] = sorted_children
+        return sorted_children
 
     def iter_all(self) -> Iterator["FileNode"]:
         """Depth-first iteration over this node and all descendants."""

@@ -8,7 +8,7 @@ import sys
 import time
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -27,6 +27,51 @@ from ..models import FileNode, format_size
 
 # Maximum number of recent file rows shown in the panel.
 MAX_RECENT_FILES = 1000
+REFRESH_DEBOUNCE_MS = 180
+
+
+class _RecentFilesJobSignals(QObject):
+    """Signals emitted by a recent-files background job."""
+
+    finished = pyqtSignal(int, list)  # (request_id, List[FileNode])
+
+
+class _RecentFilesJob(QRunnable):
+    """Background task that builds and sorts a recent-file list."""
+
+    def __init__(
+        self,
+        request_id: int,
+        source_files: Optional[List[FileNode]],
+        source_dir: Optional[FileNode],
+        scope: int,
+        time_type: int,
+        sort_by: int,
+        max_rows: int,
+    ) -> None:
+        super().__init__()
+        self._request_id = request_id
+        self._source_files = source_files
+        self._source_dir = source_dir
+        self._scope = scope
+        self._time_type = time_type
+        self._sort_by = sort_by
+        self._max_rows = max_rows
+        self.signals = _RecentFilesJobSignals()
+
+    def run(self) -> None:
+        if self._scope == 1 and self._source_dir is not None:
+            files: List[FileNode] = [n for n in self._source_dir.iter_all() if not n.is_dir]
+        else:
+            files = list(self._source_files or [])
+
+        if self._sort_by == 0:
+            key = (lambda n: n.create_time) if self._time_type == 1 else (lambda n: n.mod_time)
+            files.sort(key=key, reverse=True)
+        else:
+            files.sort(key=lambda n: n.size, reverse=True)
+
+        self.signals.finished.emit(self._request_id, files[: self._max_rows])
 
 
 class RecentFilesPanel(QWidget):
@@ -45,6 +90,13 @@ class RecentFilesPanel(QWidget):
         self._current_dir: Optional[FileNode] = None
         # Flat list of all file nodes in the current scan root (cached).
         self._all_files: List[FileNode] = []
+        self._thread_pool = QThreadPool.globalInstance()
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._start_refresh_job)
+        self._request_seq = 0
+        self._latest_request_id = 0
+        self._job_signals: dict[int, _RecentFilesJobSignals] = {}
         self._setup_ui()
 
     # ------------------------------------------------------------------
@@ -125,7 +177,7 @@ class RecentFilesPanel(QWidget):
         self._all_files = []
         if node is not None:
             self._collect_files(node, self._all_files)
-        self._refresh()
+        self._refresh(immediate=True)
 
     def set_current_dir(self, node: Optional[FileNode]) -> None:
         """Update the currently selected directory for scope filtering."""
@@ -143,28 +195,36 @@ class RecentFilesPanel(QWidget):
             if not node.is_dir:
                 out.append(node)
 
-    def _refresh(self) -> None:
-        """Rebuild the table according to current control settings."""
-        time_type = self._time_combo.currentIndex()   # 0=modified, 1=created
-        scope = self._scope_combo.currentIndex()       # 0=root, 1=current dir
-        sort_by = self._sort_combo.currentIndex()      # 0=time, 1=size
+    def _refresh(self, immediate: bool = False) -> None:
+        """Schedule table rebuild according to current control settings."""
+        self._request_seq += 1
+        self._latest_request_id = self._request_seq
+        if immediate:
+            self._start_refresh_job()
+            return
+        self._refresh_timer.start(REFRESH_DEBOUNCE_MS)
 
-        # Choose source
-        if scope == 1 and self._current_dir is not None:
-            files: List[FileNode] = []
-            self._collect_files(self._current_dir, files)
-        else:
-            files = list(self._all_files)
+    def _start_refresh_job(self) -> None:
+        request_id = self._latest_request_id
+        job = _RecentFilesJob(
+            request_id=request_id,
+            source_files=self._all_files,
+            source_dir=self._current_dir,
+            scope=self._scope_combo.currentIndex(),
+            time_type=self._time_combo.currentIndex(),
+            sort_by=self._sort_combo.currentIndex(),
+            max_rows=MAX_RECENT_FILES,
+        )
+        self._job_signals[request_id] = job.signals
+        job.signals.finished.connect(self._on_refresh_ready)
+        self._thread_pool.start(job)
 
-        # Sort
-        if sort_by == 0:
-            key = (lambda n: n.create_time) if time_type == 1 else (lambda n: n.mod_time)
-            files.sort(key=key, reverse=True)
-        else:
-            files.sort(key=lambda n: n.size, reverse=True)
+    def _on_refresh_ready(self, request_id: int, files: List[FileNode]) -> None:
+        self._job_signals.pop(request_id, None)
+        if request_id != self._latest_request_id:
+            return
 
-        # Limit to max rows
-        files = files[:MAX_RECENT_FILES]
+        time_type = self._time_combo.currentIndex()  # 0=modified, 1=created
 
         # Populate table (disable sorting first to avoid mid-insert thrash)
         self._table.setRowCount(0)

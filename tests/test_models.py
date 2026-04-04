@@ -89,6 +89,27 @@ class TestFileNode(unittest.TestCase):
         result = parent.get_children_sorted("invalid_key")
         self.assertEqual(len(result), 1)
 
+    def test_get_children_sorted_uses_cache(self):
+        parent = self._make_node()
+        parent.add_child(self._make_node(name="a", size=1))
+        parent.add_child(self._make_node(name="b", size=2))
+
+        first = parent.get_children_sorted("size", reverse=True)
+        second = parent.get_children_sorted("size", reverse=True)
+
+        self.assertIs(first, second)
+
+    def test_add_child_invalidates_sorted_cache(self):
+        parent = self._make_node()
+        parent.add_child(self._make_node(name="a", size=1))
+        before = parent.get_children_sorted("size", reverse=True)
+
+        parent.add_child(self._make_node(name="b", size=2))
+        after = parent.get_children_sorted("size", reverse=True)
+
+        self.assertIsNot(before, after)
+        self.assertEqual(after[0].name, "b")
+
     def test_iter_all(self):
         root = self._make_node(name="root", path="/r")
         child1 = self._make_node(name="c1", path="/r/c1")
