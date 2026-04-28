@@ -190,6 +190,8 @@ class FileSystemTreeView(QTreeView):
     """Displays a FileNode tree with sortable columns and context menu."""
 
     node_selected = pyqtSignal(object)  # emits FileNode
+    rescan_requested = pyqtSignal(str)  # emits path
+    delete_requested = pyqtSignal(str, bool)  # emits (path, is_dir)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -266,11 +268,19 @@ class FileSystemTreeView(QTreeView):
             return
 
         menu = QMenu(self)
+        rescan_act = None
+        if node.is_dir:
+            rescan_act = menu.addAction("重新扫描" if self._language == "zh" else "Re-scan")
+        delete_act = menu.addAction("删除" if self._language == "zh" else "Delete")
         open_act = menu.addAction("在文件管理器打开" if self._language == "zh" else "Open in File Manager")
         copy_act = menu.addAction("复制路径" if self._language == "zh" else "Copy Path")
         action = menu.exec(self.viewport().mapToGlobal(pos))
 
-        if action == open_act:
+        if action == rescan_act and node.is_dir:
+            self.rescan_requested.emit(node.path)
+        elif action == delete_act:
+            self.delete_requested.emit(node.path, node.is_dir)
+        elif action == open_act:
             self._open_in_file_manager(node.path)
         elif action == copy_act:
             QApplication.clipboard().setText(node.path)

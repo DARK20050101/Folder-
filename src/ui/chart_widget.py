@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QRect, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import QLabel, QSizePolicy, QStackedLayout, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QStackedLayout, QVBoxLayout, QWidget
 
 from ..models import FileNode, format_size
 
@@ -226,6 +226,12 @@ class ComparisonChartWidget(QWidget):
         self._selected_path = selected_path
         self.update()
 
+    def content_height(self) -> int:
+        row_height = 18
+        gap = 8
+        base_y = 56
+        return base_y + len(self._rows) * (row_height + gap) + 48
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
             return
@@ -317,6 +323,131 @@ class ComparisonChartWidget(QWidget):
         painter.setPen(QColor("#4d617f"))
         guide = "点击条目定位目录" if self._language == "zh" else "Click a bar to locate the folder"
         painter.drawText(margin, guide_y, self.width() - margin * 2, 20, Qt.AlignmentFlag.AlignLeft, guide)
+        painter.end()
+
+
+class HistoryTrendChartWidget(QWidget):
+    """Clickable historical trend lines for level-1/level-2 directories."""
+
+    path_clicked = pyqtSignal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._row_h = 36
+        self._gap = 8
+        self._base_y = 56
+        self._rows: List[Tuple[str, str, List[int]]] = []  # (name, full_path, series)
+        self._x_labels: List[str] = []
+        self._title = ""
+        self._language = "en"
+        self._row_hit_areas: List[Tuple[QRect, str]] = []
+
+    def set_language(self, language: str) -> None:
+        self._language = language
+        self.update()
+
+    def set_data(self, title: str, rows: List[Tuple[str, str, List[int]]], x_labels: List[str]) -> None:
+        self._title = title
+        self._rows = list(rows)
+        self._x_labels = x_labels
+        self.update()
+
+    def content_height(self) -> int:
+        return self._base_y + len(self._rows) * (self._row_h + self._gap) + 50
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        for rect, path in self._row_hit_areas:
+            if rect.contains(pos):
+                self.path_clicked.emit(path)
+                return
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._row_hit_areas = []
+
+        painter.fillRect(self.rect(), QColor("#f8fbff"))
+        if not self._rows:
+            painter.setPen(QColor("#44526e"))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "暂无历史变化数据" if self._language == "zh" else "No history trend data.",
+            )
+            painter.end()
+            return
+
+        margin = 14
+        title_font = QFont("Segoe UI", 11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#1f2f4b"))
+        painter.drawText(margin, margin, self.width() - margin * 2, 24, Qt.AlignmentFlag.AlignLeft, self._title)
+
+        base_y = self._base_y
+        row_h = self._row_h
+        gap = self._gap
+        left_label_w = 210
+        right_info_w = 150
+        chart_x = margin + left_label_w
+        chart_w = max(self.width() - chart_x - right_info_w - margin, 180)
+
+        font = QFont("Segoe UI", 8)
+        painter.setFont(font)
+
+        palette = [QColor("#2b6cb0"), QColor("#d9534f"), QColor("#2f855a"), QColor("#805ad5")]
+
+        for i, (name, path, series) in enumerate(self._rows):
+            y = base_y + i * (row_h + gap)
+            row_rect = QRect(margin, y - 1, self.width() - margin * 2, row_h + 2)
+            self._row_hit_areas.append((row_rect, path))
+
+            painter.setPen(QColor("#2f3d59"))
+            label = name if len(name) <= 28 else name[:25] + "..."
+            painter.drawText(margin, y, left_label_w - 8, row_h, Qt.AlignmentFlag.AlignVCenter, label)
+
+            max_v = max(series) if series else 1
+            min_v = min(series) if series else 0
+            span = max(max_v - min_v, 1)
+            pts = []
+            count = max(len(series), 2)
+            for idx, value in enumerate(series):
+                px = chart_x + int(idx * (chart_w / (count - 1)))
+                py = y + row_h - 6 - int((value - min_v) / span * (row_h - 12))
+                pts.append((px, py))
+
+            painter.setPen(QPen(QColor("#d7e2f2"), 1))
+            painter.drawRect(chart_x, y + 4, chart_w, row_h - 8)
+
+            if len(pts) >= 2:
+                pen = QPen(palette[i % len(palette)], 2)
+                painter.setPen(pen)
+                for p0, p1 in zip(pts[:-1], pts[1:]):
+                    painter.drawLine(p0[0], p0[1], p1[0], p1[1])
+
+            if pts:
+                painter.setBrush(QBrush(palette[i % len(palette)]))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(pts[-1][0] - 3, pts[-1][1] - 3, 6, 6)
+
+            first = series[0] if series else 0
+            last = series[-1] if series else 0
+            delta = last - first
+            detail = f"{format_size(first)} -> {format_size(last)}"
+            sign = "+" if delta >= 0 else ""
+            detail2 = f"{sign}{format_size(delta)}"
+            painter.setPen(QColor("#334155"))
+            painter.drawText(chart_x + chart_w + 8, y + 2, right_info_w, 15, Qt.AlignmentFlag.AlignLeft, detail)
+            painter.drawText(chart_x + chart_w + 8, y + 18, right_info_w, 15, Qt.AlignmentFlag.AlignLeft, detail2)
+
+        guide_y = base_y + len(self._rows) * (row_h + gap) + 8
+        painter.setPen(QColor("#4d617f"))
+        guide = "点击条目查看下一层历史变化" if self._language == "zh" else "Click a row to open next-level history"
+        painter.drawText(margin, guide_y, self.width() - margin * 2, 20, Qt.AlignmentFlag.AlignLeft, guide)
+
         painter.end()
 
 
@@ -441,10 +572,16 @@ class SizeChartWidget(QWidget):
     """Container that shows a title, pie chart and bar chart for a FileNode."""
 
     compare_path_requested = pyqtSignal(str)
+    history_path_requested = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._language = "en"
+        self._compare_current_root_id: Optional[int] = None
+        self._compare_baseline_root_id: Optional[int] = None
+        self._compare_root_node: Optional[FileNode] = None
+        self._compare_node_index: Dict[str, FileNode] = {}
+        self._compare_baseline_size_index: Dict[str, int] = {}
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(8, 8, 8, 8)
 
@@ -478,9 +615,26 @@ class SizeChartWidget(QWidget):
         self._stack.addWidget(normal_page)
 
         # Comparison page
+        self._compare_page = QWidget()
+        compare_layout = QVBoxLayout(self._compare_page)
+        compare_layout.setContentsMargins(0, 0, 0, 0)
+        self._compare_scroll = QScrollArea()
+        self._compare_scroll.setWidgetResizable(True)
+        self._compare_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._compare_container = QWidget()
+        self._compare_container_layout = QVBoxLayout(self._compare_container)
+        self._compare_container_layout.setContentsMargins(0, 0, 0, 0)
         self._compare = ComparisonChartWidget()
         self._compare.path_clicked.connect(self.compare_path_requested.emit)
-        self._stack.addWidget(self._compare)
+        self._compare_container_layout.addWidget(self._compare)
+        self._compare_scroll.setWidget(self._compare_container)
+        compare_layout.addWidget(self._compare_scroll)
+        self._stack.addWidget(self._compare_page)
+
+        # History trend page
+        self._history = HistoryTrendChartWidget()
+        self._history.path_clicked.connect(self.history_path_requested.emit)
+        self._stack.addWidget(self._history)
 
         self.setMinimumWidth(300)
         self.show_cover()
@@ -501,6 +655,7 @@ class SizeChartWidget(QWidget):
         self._language = language
         self._cover.set_language(language)
         self._compare.set_language(language)
+        self._history.set_language(language)
         if not self._title_label.text() or self._title_label.text() in {
             "Select a folder to see its contents",
             "选择文件夹后可查看容量分布",
@@ -526,43 +681,62 @@ class SizeChartWidget(QWidget):
 
         if current_root is None:
             self._compare.set_data(title, rows, selected_path)
-            self._stack.setCurrentWidget(self._compare)
+            self._stack.setCurrentWidget(self._compare_page)
             return
 
+        self._ensure_compare_indexes(current_root, baseline_root)
+
         if focus_path:
-            focus_node = current_root.find(focus_path)
+            focus_node = self._compare_node_index.get(focus_path)
             if focus_node and focus_node.is_dir:
                 rel_depth = self._depth_from_root(current_root.path, focus_node.path)
                 if rel_depth <= 0:
-                    rows = self._build_level_rows(current_root, baseline_root, level=1, parent_path=None)
+                    rows = self._build_level_rows(parent_path=None)
                     title = (
                         "Level 1 folder changes"
                         if self._language == "en"
                         else "一级目录容量变化"
                     )
-                elif rel_depth == 1:
-                    rows = self._build_level_rows(current_root, baseline_root, level=2, parent_path=focus_node.path)
-                    title = (
-                        f"Level 2 under {focus_node.name}"
-                        if self._language == "en"
-                        else f"{focus_node.name} 下二级目录变化"
-                    )
                 else:
-                    parent_path = os.path.dirname(focus_node.path)
-                    parent_node = current_root.find(parent_path)
-                    if parent_node is not None:
-                        rows = self._build_level_rows(current_root, baseline_root, level=2, parent_path=parent_path)
-                        title = (
-                            f"Level 2 under {parent_node.name}"
-                            if self._language == "en"
-                            else f"{parent_node.name} 下二级目录变化"
-                        )
+                    rows = self._build_level_rows(parent_path=focus_node.path)
+                    next_level = rel_depth + 1
+                    title = (
+                        f"Level {next_level} under {focus_node.name}"
+                        if self._language == "en"
+                        else f"{focus_node.name} 下第{next_level}级目录变化"
+                    )
         if not rows:
-            rows = self._build_level_rows(current_root, baseline_root, level=1, parent_path=None)
+            rows = self._build_level_rows(parent_path=None)
             title = "Level 1 folder changes" if self._language == "en" else "一级目录容量变化"
 
         self._compare.set_data(title, rows, selected_path)
-        self._stack.setCurrentWidget(self._compare)
+        self._compare.setMinimumHeight(max(self._compare.content_height(), 520))
+        self._stack.setCurrentWidget(self._compare_page)
+
+    def show_history_trend(
+        self,
+        disk_path: str,
+        snapshots: List[Tuple[str, FileNode]],
+        parent_path: Optional[str],
+    ) -> None:
+        x_labels = [label.split("|")[-1].strip() for label, _ in snapshots]
+        rows = self._build_history_rows(snapshots, parent_path)
+
+        if parent_path:
+            title = (
+                f"History Trend: {os.path.basename(parent_path) or parent_path}"
+                if self._language == "en"
+                else f"历史变化：{os.path.basename(parent_path) or parent_path}"
+            )
+        else:
+            title = (
+                f"History Trend (Level 1): {disk_path}"
+                if self._language == "en"
+                else f"一级目录历史变化：{disk_path}"
+            )
+
+        self._history.set_data(title, rows, x_labels)
+        self._stack.setCurrentWidget(self._history)
 
     def display(self, node: Optional[FileNode]) -> None:
         self._stack.setCurrentIndex(1)
@@ -601,31 +775,86 @@ class SizeChartWidget(QWidget):
             return 0
         return len([p for p in rel.split(os.sep) if p and p != "."])
 
-    def _build_level_rows(
-        self,
-        current_root: FileNode,
-        baseline_root: Optional[FileNode],
-        level: int,
-        parent_path: Optional[str],
-    ) -> List[Tuple[str, str, int, int]]:
+    def _build_level_rows(self, parent_path: Optional[str]) -> List[Tuple[str, str, int, int]]:
         rows: List[Tuple[str, str, int, int]] = []
-        if level == 1:
-            source_parent = current_root
-        else:
-            if not parent_path:
+        if parent_path is None:
+            if self._compare_root_node is None:
                 return rows
-            source_parent = current_root.find(parent_path)
+            source_parent = self._compare_root_node
+        else:
+            source_parent = self._compare_node_index.get(parent_path)
             if source_parent is None:
                 return rows
 
         current_dirs = [n for n in source_parent.get_children_sorted("size") if n.is_dir]
         for node in current_dirs:
-            previous_size = 0
-            if baseline_root is not None:
-                old = baseline_root.find(node.path)
-                if old is not None:
-                    previous_size = old.size
+            previous_size = self._compare_baseline_size_index.get(node.path, 0)
             rows.append((node.name, node.path, node.size, previous_size))
 
         rows.sort(key=lambda r: abs(r[2] - r[3]), reverse=True)
+        return rows
+
+    def _ensure_compare_indexes(
+        self,
+        current_root: FileNode,
+        baseline_root: Optional[FileNode],
+    ) -> None:
+        current_id = id(current_root)
+        if self._compare_current_root_id != current_id:
+            self._compare_current_root_id = current_id
+            self._compare_root_node = current_root
+            self._compare_node_index = self._build_node_index(current_root)
+
+        baseline_id = id(baseline_root) if baseline_root is not None else None
+        if self._compare_baseline_root_id != baseline_id:
+            self._compare_baseline_root_id = baseline_id
+            self._compare_baseline_size_index = (
+                self._build_size_index(baseline_root) if baseline_root is not None else {}
+            )
+
+    @staticmethod
+    def _build_node_index(root: FileNode) -> Dict[str, FileNode]:
+        index: Dict[str, FileNode] = {}
+        stack: List[FileNode] = [root]
+        while stack:
+            node = stack.pop()
+            index[node.path] = node
+            if node.children:
+                stack.extend(node.children)
+        return index
+
+    @staticmethod
+    def _build_size_index(root: FileNode) -> Dict[str, int]:
+        index: Dict[str, int] = {}
+        stack: List[FileNode] = [root]
+        while stack:
+            node = stack.pop()
+            index[node.path] = int(node.size)
+            if node.children:
+                stack.extend(node.children)
+        return index
+
+    def _build_history_rows(
+        self,
+        snapshots: List[Tuple[str, FileNode]],
+        parent_path: Optional[str],
+    ) -> List[Tuple[str, str, List[int]]]:
+        if not snapshots:
+            return []
+
+        latest_root = snapshots[-1][1]
+        base_node = latest_root if not parent_path else latest_root.find(parent_path)
+        if base_node is None:
+            return []
+
+        target_dirs = [n for n in base_node.get_children_sorted("size") if n.is_dir][:16]
+        rows: List[Tuple[str, str, List[int]]] = []
+        for node in target_dirs:
+            series: List[int] = []
+            for _label, root in snapshots:
+                old = root.find(node.path)
+                series.append(old.size if old is not None else 0)
+            rows.append((node.name, node.path, series))
+
+        rows.sort(key=lambda item: abs(item[2][-1] - item[2][0]) if item[2] else 0, reverse=True)
         return rows
